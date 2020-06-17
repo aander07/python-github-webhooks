@@ -1,3 +1,4 @@
+#!/usr/bin/python
 # -*- coding: utf-8 -*-
 #
 # Copyright (C) 2014, 2015, 2016 Carlos Jenkins <carlos@jenkins.co.cr>
@@ -14,13 +15,17 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+"""
+Generic webhooks receiver for GitHub
+
+Based on https://github.com/carlos-jenkins/python-github-webhooks
+"""
 
 import logging
 from sys import stderr, hexversion
-logging.basicConfig(stream=stderr)
 
 import hmac
-from hashlib import sha1
+import hashlib
 from json import loads, dumps
 from subprocess import Popen, PIPE
 from tempfile import mkstemp
@@ -31,8 +36,35 @@ import requests
 from ipaddress import ip_address, ip_network
 from flask import Flask, request, abort
 
+logging.basicConfig(stream=stderr)
+application = Flask(__name__) # pylint: disable=invalid-name
 
-application = Flask(__name__)
+class GithubMeta(object):
+    """
+    Cache the Github Meta data
+    """
+
+    def __init__(self):
+        self._ips = []
+        self._etag = ''
+
+    @property
+    def ips(self):
+        """Return the IP list"""
+        return self._ips
+
+    @ips.setter
+    def ips(self, val):
+        self._ips = val
+
+    @property
+    def etag(self):
+        """Return the eTag"""
+        return self._etag
+
+    @etag.setter
+    def etag(self, val):
+        self._etag = val
 
 
 @application.route('/', methods=['GET', 'POST'])
@@ -58,14 +90,29 @@ def index():
         src_ip = ip_address(
             u'{}'.format(request.access_route[0])  # Fix stupid ipaddress issue
         )
-        whitelist = requests.get('https://api.github.com/meta').json()['hooks']
+        resp = requests.get(
+            'https://api.github.com/meta',
+            headers={'If-None-Match': ghm.etag}
+        )
+        if resp.status_code in [200]:
+            ghm.etag = resp.headers['eTag']
+            ghm.ips = resp.json()['hooks']
+        elif resp.status_code not in [304]:
+            abort(resp.status_code)
+
+        whitelist = ghm.ips
+
+        if config.get('allow_loopback', False) and u'127.0.0.0/8' not in whitelist:
+            whitelist.append(u'127.0.0.0/8')
+            ghm.ips = whitelist
 
         for valid_ip in whitelist:
             if src_ip in ip_network(valid_ip):
                 break
         else:
-            logging.error('IP {} not allowed'.format(
-                src_ip
+            logging.error('IP {} not allowed {}'.format(
+                src_ip,
+                whitelist
             ))
             abort(403)
 
@@ -82,7 +129,7 @@ def index():
             abort(501)
 
         # HMAC requires the key to be bytes, but data is string
-        mac = hmac.new(str(secret), msg=request.data, digestmod='sha1')
+        mac = hmac.new(key=str(secret), msg=request.data, digestmod=hashlib.sha1)
 
         # Python prior to 2.7.7 does not have hmac.compare_digest
         if hexversion >= 0x020707F0:
@@ -92,7 +139,7 @@ def index():
             # What compare_digest provides is protection against timing
             # attacks; we can live without this protection for a web-based
             # application
-            if not str(mac.hexdigest()) == str(signature):
+            if str(mac.hexdigest()) != str(signature):
                 abort(403)
 
     # Implement ping
@@ -165,29 +212,29 @@ def index():
 
     # Save payload to temporal file
     osfd, tmpfile = mkstemp()
-    with fdopen(osfd, 'w') as pf:
-        pf.write(dumps(payload))
+    with fdopen(osfd, 'w') as payloadfile:
+        payloadfile.write(dumps(payload))
 
     # Run scripts
     ran = {}
-    for s in scripts:
+    for scr in scripts:
 
         proc = Popen(
-            [s, tmpfile, event],
+            [scr, tmpfile, event],
             stdout=PIPE, stderr=PIPE
         )
-        stdout, stderr = proc.communicate()
+        p_stdout, p_stderr = proc.communicate()
 
-        ran[basename(s)] = {
+        ran[basename(scr)] = {
             'returncode': proc.returncode,
-            'stdout': stdout.decode('utf-8'),
-            'stderr': stderr.decode('utf-8'),
+            'stdout': p_stdout.decode('utf-8'),
+            'stderr': p_stderr.decode('utf-8'),
         }
 
         # Log errors if a hook failed
         if proc.returncode != 0:
             logging.error('{} : {} \n{}'.format(
-                s, proc.returncode, stderr
+                scr, proc.returncode, p_stderr
             ))
 
     # Remove temporal file
@@ -201,6 +248,17 @@ def index():
     logging.info(output)
     return output
 
+@application.route('/check', methods=['GET', 'HEAD'])
+def check():
+    """
+    HAproxy check
+    """
+    # Only GET is implemented
+    if request.method not in ['GET', 'HEAD']:
+        abort(501)
+
+    return 'ok'
 
 if __name__ == '__main__':
-    application.run(debug=True, host='0.0.0.0')
+    ghm = GithubMeta()
+    application.run(debug=True, host='0.0.0.0', port=6000)
